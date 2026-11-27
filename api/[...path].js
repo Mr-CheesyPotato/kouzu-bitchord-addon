@@ -391,10 +391,13 @@ export default async function handler(req, res) {
     }
   }
 
-  if (path.startsWith("/stream/")) {
+  if (path === "/stream" || path.startsWith("/stream/")) {
     let id;
-    try { id = decodeURIComponent(path.slice("/stream/".length)); }
-    catch { return json(res, 400, { error: "Malformed track ID" }); }
+    try {
+      id = path === "/stream" ? url.searchParams.get("id") : decodeURIComponent(path.slice("/stream/".length));
+    } catch {
+      return json(res, 400, { error: "Malformed track ID" });
+    }
     return streamResolve(res, id, url.searchParams.get("quality"));
   }
 
@@ -407,8 +410,9 @@ export default async function handler(req, res) {
     "/extras/album": ["/api/v1/ytm/album", "id"],
     "/extras/ytm-lyrics": ["/api/v1/ytm/lyrics", "id"]
   };
-  if (extraRoutes[path]) {
-    const [endpoint, param] = extraRoutes[path];
+  const extraPath = path === "/extras" ? `/extras/${url.searchParams.get("resource") || ""}` : path;
+  if (extraRoutes[extraPath]) {
+    const [endpoint, param] = extraRoutes[extraPath];
     const id = url.searchParams.get(param);
     if (!id) return json(res, 400, { error: `Missing ${param}` });
     try { return json(res, 200, await muzo(endpoint, { [param]: id })); }

@@ -117,10 +117,10 @@ async function invoke(path, { method = "GET", headers = {} } = {}) {
   return { status: response.statusCode, headers: response.headers, body };
 }
 
-test("Vercel dynamic rewrites target the catch-all API function", () => {
+test("Vercel dynamic rewrites target the single-segment API function", () => {
   const config = JSON.parse(readFileSync(new URL("./vercel.json", import.meta.url), "utf8"));
-  assert.ok(config.rewrites.some(route => route.source === "/stream/:id" && route.destination === "/api/stream/:id"));
-  assert.ok(config.rewrites.some(route => route.source === "/extras/:path*" && route.destination === "/api/extras/:path*"));
+  assert.ok(config.rewrites.some(route => route.source === "/stream/:id" && route.destination === "/api/stream?id=:id"));
+  assert.ok(config.rewrites.some(route => route.source === "/extras/:resource" && route.destination === "/api/extras?resource=:resource"));
 });
 
 test("manifest is public and advertises only supported quality selections", async () => {
@@ -132,7 +132,7 @@ test("manifest is public and advertises only supported quality selections", asyn
 });
 
 test("search, stream, and extras reject unauthenticated requests with the BitChord challenge", async () => {
-  for (const path of ["/search?q=signal", "/stream/ytm:abcdefghijk", "/extras/lyrics?id=abcdefghijk", "/api/stream/ytm:abcdefghijk", "/api/extras/lyrics?id=abcdefghijk"]) {
+  for (const path of ["/search?q=signal", "/stream/ytm:abcdefghijk", "/extras/lyrics?id=abcdefghijk", "/api/stream?id=ytm%3Aabcdefghijk", "/api/extras?resource=lyrics&id=abcdefghijk"]) {
     const response = await invoke(path);
     assert.equal(response.status, 401);
     assert.match(response.headers["www-authenticate"], /^BitChord realm=/);
@@ -156,15 +156,27 @@ test("search maps the existing Muzo response shape and keeps its key in the serv
   assert.equal(muzoCalls[0].apiKey, "unit-test-api-key");
 });
 
+test("rewritten extras resource and id parameters reach the expected Muzo route", async () => {
+  resetMuzo();
+  setMuzoResponse("/api/v1/lyrics", 200, { lyrics: "Example lyrics" });
+  const response = await invoke("/api/extras?resource=lyrics&id=abcdefghijk", { headers: await bitChordHeaders() });
+  assert.equal(response.status, 200);
+  assert.deepEqual(response.body, { lyrics: "Example lyrics" });
+  assert.equal(muzoCalls[0].pathname, "/api/v1/lyrics");
+  assert.equal(muzoCalls[0].params.get("id"), "abcdefghijk");
+});
+
 test("lossless uses its resolver path while high and low share the single AAC path", async () => {
   resetMuzo();
   const headers = await bitChordHeaders();
   const lossless = await invoke("/stream/ytm:abcdefghijk?quality=lossless", { headers });
   const high = await invoke("/stream/ytm:abcdefghijk?quality=high", { headers });
   const low = await invoke("/stream/ytm:abcdefghijk?quality=low", { headers });
+  const rewritten = await invoke("/api/stream?id=ytm%3Aabcdefghijk&quality=aac", { headers });
   assert.equal(lossless.status, 200);
   assert.equal(high.status, 200);
   assert.equal(low.status, 200);
+  assert.equal(rewritten.status, 200);
   assert.equal(high.body.codec, "aac");
   assert.equal(high.body.bitrate, 256000);
   assert.equal(high.body.sampleRate, 44100);
@@ -172,8 +184,10 @@ test("lossless uses its resolver path while high and low share the single AAC pa
   assert.deepEqual(muzoCalls.map(call => call.pathname), [
     "/api/v1/stream/lossless",
     "/api/v1/stream/aac",
+    "/api/v1/stream/aac",
     "/api/v1/stream/aac"
   ]);
+  assert.equal(muzoCalls[3].params.get("id"), "abcdefghijk");
 });
 
 test("lossless fallback is retained and unknown quality values are rejected", async () => {
