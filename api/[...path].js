@@ -1,5 +1,6 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { createBitChordAuth } from "../bitchord-addon-auth.mjs";
 
 const BASE = "https://data.kouzu.in";
@@ -56,7 +57,7 @@ async function muzo(path, params = {}) {
   let data;
   try { data = text ? JSON.parse(text) : {}; } catch { data = { error: "Invalid JSON from Muzo" }; }
   if (!response.ok) {
-    const error = new Error(data?.error || `Muzo returned HTTP ${response.status}`);
+    const error = new Error(`Muzo returned HTTP ${response.status}`);
     error.status = response.status;
     error.data = data;
     error.rateRemaining = response.headers.get("X-RateLimit-Remaining");
@@ -81,7 +82,8 @@ function trackFrom(item) {
   if (!item || typeof item !== "object") return null;
   const rawId = item.videoId || item.video_id || item.id || item.playlistItemData?.videoId;
   const id = videoIdFrom(rawId);
-  if (!id) return null;
+  const title = firstText(item.title || item.name).trim();
+  if (!id || !title) return null;
   const thumbs = item.thumbnails || item.thumbnail || item.thumbnails?.[0];
   const artworkURL = Array.isArray(thumbs)
     ? (thumbs.at(-1)?.url || thumbs[0]?.url || "")
@@ -95,7 +97,7 @@ function trackFrom(item) {
   const artists = item.artists || item.artist || item.author || item.subtitle;
   return {
     id: `ytm:${id}`,
-    title: item.title || item.name || "Unknown title",
+    title,
     artist: firstText(artists) || "Unknown artist",
     ...(item.album ? { album: firstText(item.album) } : {}),
     ...(Number.isFinite(duration) && duration > 0 ? { duration } : {}),
@@ -104,14 +106,14 @@ function trackFrom(item) {
 }
 
 function signPayload(payload) {
-  if (!MEDIA_SECRET) throw Object.assign(new Error("Server is missing MEDIA_SECRET"), { status: 503 });
+  if (!MEDIA_SECRET || MEDIA_SECRET.length < 32) throw Object.assign(new Error("MEDIA_SECRET must be configured with at least 32 characters"), { status: 503 });
   const encoded = Buffer.from(JSON.stringify(payload)).toString("base64url");
   const sig = createHmac("sha256", MEDIA_SECRET).update(encoded).digest("base64url");
   return `${encoded}.${sig}`;
 }
 
 function verifyPayload(token) {
-  if (!MEDIA_SECRET || typeof token !== "string") return null;
+  if (!MEDIA_SECRET || MEDIA_SECRET.length < 32 || typeof token !== "string") return null;
   const [encoded, signature, extra] = token.split(".");
   if (!encoded || !signature || extra) return null;
   const expected = createHmac("sha256", MEDIA_SECRET).update(encoded).digest();
@@ -120,7 +122,7 @@ function verifyPayload(token) {
   if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) return null;
   let payload;
   try { payload = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8")); } catch { return null; }
-  if (!payload?.exp || payload.exp < Math.floor(Date.now() / 1000)) return null;
+  if (!Number.isSafeInteger(payload?.exp) || payload.exp <= Math.floor(Date.now() / 1000)) return null;
   if (!videoIdFrom(payload.id) || typeof payload.upstream !== "string") return null;
   // Prevent a signed token from being used to make this server fetch arbitrary URLs.
   let upstream;
@@ -136,6 +138,9 @@ function numberFrom(value) {
 }
 
 function sampleRateFrom(value) {
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+    return Math.round(value < 1000 ? value * 1000 : value);
+  }
   const match = String(value || "").match(/([\d.]+)\s*k?hz/i);
   if (!match) return undefined;
   const n = Number(match[1]);
@@ -163,17 +168,20 @@ async function streamResolve(res, id, qualityValue) {
     const token = signPayload({ id: videoId, quality, upstream, exp: Math.floor(Date.now() / 1000) + 1800 });
     const mediaUrl = `https://${ADDON_HOST}/media?token=${encodeURIComponent(token)}`;
 
-    // Catalog ingestion is open, free and does not use the API key. Best effort after resolving.
-    fetch(`${BASE}/api/v1/stream/add?id=${encodeURIComponent(videoId)}`).catch(() => {});
-
-    const formatText = String(result.format || "").toLowerCase();
-    const qualityText = String(result.bitrate || result.quality || "");
-    const isFlac = formatText.includes("flac") || String(upstream).includes("/flac/");
-    const codec = isFlac ? "flac" : "aac";
-    const sampleRate = sampleRateFrom(qualityText);
-    const bitDepth = numberFrom(qualityText.match(/\d+\s*[- ]?bit/i)?.[0]);
+    const qualityText = String(result.quality || result.audioQuality || result.bitrate || "");
+    const sampleRate = sampleRateFrom(result.sampleRate ?? qualityText);
+    const bitDepth = numberFrom(result.bitDepth ?? qualityText.match(/\d+\s*[- ]?bit/i)?.[0]);
+    const stream = { url: mediaUrl };
+    for (const field of ["format", "codec", "container", "manifest"]) {
+      if (typeof result[field] === "string" && result[field].trim()) stream[field] = result[field].trim().toLowerCase();
+    }
+    const qualityLabel = result.quality ?? result.audioQuality;
+    if (typeof qualityLabel === "string" && qualityLabel.trim()) stream.quality = qualityLabel.trim();
+    if (typeof result.encrypted === "boolean") stream.encrypted = result.encrypted;
+    if (sampleRate) stream.sampleRate = sampleRate;
+    if (bitDepth) stream.bitDepth = bitDepth;
     let bitrate;
-    if (typeof result.bitrate === "number" && Number.isFinite(result.bitrate)) bitrate = result.bitrate;
+    if (typeof result.bitrate === "number" && Number.isFinite(result.bitrate) && result.bitrate > 0) bitrate = result.bitrate;
     else if (typeof result.bitrate === "string") {
       const match = result.bitrate.match(/([\d.]+)\s*(kbps|mbps|bps)\b/i);
       if (match) {
@@ -181,18 +189,8 @@ async function streamResolve(res, id, qualityValue) {
         bitrate = /mbps/i.test(match[2]) ? n * 1000000 : /kbps/i.test(match[2]) ? n * 1000 : n;
       }
     }
-    return json(res, 200, {
-      url: mediaUrl,
-      format: isFlac ? "flac" : "m4a",
-      quality: result.bitrate || (quality === "lossless" ? "Lossless (actual source reported by Muzo)" : "AAC"),
-      codec,
-      container: isFlac ? "flac" : "m4a",
-      manifest: "none",
-      encrypted: false,
-      ...(sampleRate ? { sampleRate } : {}),
-      ...(bitDepth ? { bitDepth } : {}),
-      ...(bitrate ? { bitrate: bitrate < 10000 ? Math.round(bitrate * 1000) : Math.round(bitrate) } : {})
-    });
+    if (bitrate) stream.bitrate = Math.round(bitrate);
+    return json(res, 200, stream);
   } catch (err) {
     const status = err.status === 401 ? 502 : err.status === 429 ? 429 : err.status === 404 ? 404 : err.status === 503 ? 503 : 502;
     return json(res, status, { error: err.message || "Unable to resolve stream", ...(err.rateRemaining ? { rateLimitRemaining: err.rateRemaining } : {}) }, status === 429 ? { "Retry-After": "3600" } : {});
@@ -215,7 +213,7 @@ async function proxyMedia(req, res, token) {
     }
     res.setHeader("Cache-Control", "private, no-store");
     if (!upstream.body) return res.end();
-    Readable.fromWeb(upstream.body).pipe(res);
+    await pipeline(Readable.fromWeb(upstream.body), res);
   } catch (err) {
     if (!res.headersSent) json(res, 502, { error: "Unable to fetch media from CDN" });
     else res.destroy(err);

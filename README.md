@@ -37,6 +37,5 @@ BitChord currently consumes only the manifest, search and stream contracts. The 
 - The API key is only used server-side.
 - Muzo resolver calls consume quota; CDN media bytes do not.
 - The media proxy uses signed URLs that expire after 30 minutes and forwards HTTP byte ranges for seeking.
-- The `stream/add` call is best-effort and does not use a key or quota.
 - The `lossless` choice requests Muzo's lossless resolver; the returned codec/format reflects the actual response where detectable. It is not a guarantee that every track has a lossless source.
 - Official BitChord addon authentication is enforced on JSON routes except the public manifest and signed media route.
