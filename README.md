@@ -11,7 +11,7 @@ This project exposes BitChord's `/manifest.json`, `/search`, and `/stream/:id` c
 3. Set these Vercel Environment Variables for Production (and Preview only if needed):
    - `MUZO_API_KEY`: your private Muzo key
    - `MEDIA_SECRET`: a random secret of at least 32 characters
-   - `ADDON_HOST`: your exact deployed hostname, e.g. `your-project.vercel.app` (no scheme, path or port)
+   - `ADDON_HOST`: your exact deployed hostname, e.g. `your-project.vercel.app` (no scheme, path or port). If the addon is reachable through multiple hostnames, list them comma-separated; the first hostname is used for generated media URLs.
 4. Redeploy after adding/changing environment variables.
 5. Test `https://YOUR_HOST/manifest.json`, then add `https://YOUR_HOST` in BitChord → Settings → Sources → Add an addon.
 

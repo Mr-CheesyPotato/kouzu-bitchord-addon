@@ -5,10 +5,11 @@ import { createBitChordAuth } from "../bitchord-addon-auth.mjs";
 const BASE = "https://data.kouzu.in";
 const API_KEY = process.env.MUZO_API_KEY;
 const MEDIA_SECRET = process.env.MEDIA_SECRET;
-const ADDON_HOST = process.env.ADDON_HOST;
+const ADDON_HOSTS = [...new Set((process.env.ADDON_HOST || "").split(",").map(host => host.trim().toLowerCase()).filter(Boolean))];
+const ADDON_HOST = ADDON_HOSTS[0];
 
 // Official BitChord request verifier. Keep the manifest public; guard all other JSON routes.
-const auth = createBitChordAuth({ hosts: ADDON_HOST ? [ADDON_HOST.toLowerCase()] : [] });
+const auth = ADDON_HOSTS.length ? createBitChordAuth({ hosts: ADDON_HOSTS }) : null;
 
 const manifest = {
   id: "in.kouzu.muzo",
@@ -41,7 +42,7 @@ function json(res, status, body, extraHeaders = {}) {
 }
 
 function apiHeaders() {
-  if (!API_KEY) throw new Error("Server is missing MUZO_API_KEY");
+  if (!API_KEY) throw Object.assign(new Error("Server is missing MUZO_API_KEY"), { status: 503 });
   return { "X-API-Key": API_KEY, "Accept": "application/json" };
 }
 
@@ -65,7 +66,7 @@ async function muzo(path, params = {}) {
 }
 
 function videoIdFrom(value) {
-  const raw = decodeURIComponent(String(value || "")).replace(/^ytm:/, "");
+  const raw = String(value || "").replace(/^ytm:/, "");
   return /^[A-Za-z0-9_-]{11}$/.test(raw) ? raw : null;
 }
 
@@ -76,9 +77,11 @@ function firstText(value) {
   return "";
 }
 
-function trackFrom(item, quality) {
-  const id = item?.videoId || item?.video_id || item?.id || item?.playlistItemData?.videoId;
-  if (!videoIdFrom(id)) return null;
+function trackFrom(item) {
+  if (!item || typeof item !== "object") return null;
+  const rawId = item.videoId || item.video_id || item.id || item.playlistItemData?.videoId;
+  const id = videoIdFrom(rawId);
+  if (!id) return null;
   const thumbs = item.thumbnails || item.thumbnail || item.thumbnails?.[0];
   const artworkURL = Array.isArray(thumbs)
     ? (thumbs.at(-1)?.url || thumbs[0]?.url || "")
@@ -101,7 +104,7 @@ function trackFrom(item, quality) {
 }
 
 function signPayload(payload) {
-  if (!MEDIA_SECRET) throw new Error("Server is missing MEDIA_SECRET");
+  if (!MEDIA_SECRET) throw Object.assign(new Error("Server is missing MEDIA_SECRET"), { status: 503 });
   const encoded = Buffer.from(JSON.stringify(payload)).toString("base64url");
   const sig = createHmac("sha256", MEDIA_SECRET).update(encoded).digest("base64url");
   return `${encoded}.${sig}`;
@@ -122,7 +125,7 @@ function verifyPayload(token) {
   // Prevent a signed token from being used to make this server fetch arbitrary URLs.
   let upstream;
   try { upstream = new URL(payload.upstream); } catch { return null; }
-  if (upstream.protocol !== "https:" || !upstream.hostname.endsWith("workers.dev")) return null;
+  if (upstream.protocol !== "https:" || (upstream.hostname !== "workers.dev" && !upstream.hostname.endsWith(".workers.dev"))) return null;
   return payload;
 }
 
@@ -139,10 +142,10 @@ function sampleRateFrom(value) {
   return /khz/i.test(match[0]) || n < 1000 ? Math.round(n * 1000) : Math.round(n);
 }
 
-async function streamResolve(req, res, id) {
+async function streamResolve(res, id, qualityValue) {
   const videoId = videoIdFrom(id);
   if (!videoId) return json(res, 400, { error: "Expected an 11-character YouTube video ID" });
-  const requested = String(req.query.quality || "lossless").toLowerCase();
+  const requested = String(qualityValue || "lossless").toLowerCase();
   const quality = requested === "low" ? "low" : requested === "high" ? "high" : "lossless";
   const endpoint = quality === "lossless" ? "/api/v1/stream/lossless" : "/api/v1/stream/aac";
 
@@ -158,9 +161,7 @@ async function streamResolve(req, res, id) {
     const upstream = result.streamUrl || result.url;
     if (!upstream) return json(res, 502, { error: "Muzo did not return a stream URL" });
     const token = signPayload({ id: videoId, quality, upstream, exp: Math.floor(Date.now() / 1000) + 1800 });
-    const host = req.headers["x-forwarded-host"] || req.headers.host;
-    const proto = req.headers["x-forwarded-proto"] || "https";
-    const mediaUrl = `${proto}://${host}/media?token=${encodeURIComponent(token)}`;
+    const mediaUrl = `https://${ADDON_HOST}/media?token=${encodeURIComponent(token)}`;
 
     // Catalog ingestion is open, free and does not use the API key. Best effort after resolving.
     fetch(`${BASE}/api/v1/stream/add?id=${encodeURIComponent(videoId)}`).catch(() => {});
@@ -193,12 +194,13 @@ async function streamResolve(req, res, id) {
       ...(bitrate ? { bitrate: bitrate < 10000 ? Math.round(bitrate * 1000) : Math.round(bitrate) } : {})
     });
   } catch (err) {
-    const status = err.status === 401 ? 502 : err.status === 429 ? 429 : err.status === 404 ? 404 : 502;
+    const status = err.status === 401 ? 502 : err.status === 429 ? 429 : err.status === 404 ? 404 : err.status === 503 ? 503 : 502;
     return json(res, status, { error: err.message || "Unable to resolve stream", ...(err.rateRemaining ? { rateLimitRemaining: err.rateRemaining } : {}) }, status === 429 ? { "Retry-After": "3600" } : {});
   }
 }
 
 async function proxyMedia(req, res, token) {
+  if (!API_KEY) return json(res, 503, { error: "Server is missing MUZO_API_KEY" });
   const payload = verifyPayload(token);
   if (!payload) return json(res, 403, { error: "Invalid or expired media link" });
   try {
@@ -234,6 +236,7 @@ export default async function handler(req, res) {
     const value = req.headers[name];
     if (typeof value === "string") authHeaders.set(name, value);
   }
+  if (!auth) return json(res, 503, { error: "Server is missing ADDON_HOST" });
   const denied = await auth.guard(new Request(url, { method: "GET", headers: authHeaders }));
   if (denied) {
     res.statusCode = denied.status;
@@ -246,18 +249,20 @@ export default async function handler(req, res) {
     if (!q) return json(res, 200, { tracks: [] });
     try {
       const data = await muzo("/api/v1/ytm/search", { q, filter: "songs", limit: 25 });
-      const raw = data.items || data.results || data.tracks || [];
-      const tracks = raw.map(item => trackFrom(item, url.searchParams.get("quality"))).filter(Boolean);
+      const raw = [data?.items, data?.results, data?.tracks].find(Array.isArray) || [];
+      const tracks = raw.map(trackFrom).filter(Boolean);
       return json(res, 200, { tracks });
     } catch (err) {
-      const status = err.status === 429 ? 429 : err.status === 401 ? 502 : 502;
+      const status = err.status === 429 ? 429 : err.status === 503 ? 503 : 502;
       return json(res, status, { error: err.message || "Search failed" }, status === 429 ? { "Retry-After": "3600" } : {});
     }
   }
 
   if (path.startsWith("/stream/")) {
-    const id = decodeURIComponent(path.slice("/stream/".length));
-    return streamResolve(req, res, id);
+    let id;
+    try { id = decodeURIComponent(path.slice("/stream/".length)); }
+    catch { return json(res, 400, { error: "Malformed track ID" }); }
+    return streamResolve(res, id, url.searchParams.get("quality"));
   }
 
   // Extra Muzo data endpoints. These return data; BitChord's current addon UI does not render them.
@@ -274,7 +279,7 @@ export default async function handler(req, res) {
     const id = url.searchParams.get(param);
     if (!id) return json(res, 400, { error: `Missing ${param}` });
     try { return json(res, 200, await muzo(endpoint, { [param]: id })); }
-    catch (err) { return json(res, err.status === 429 ? 429 : err.status === 404 ? 404 : 502, { error: err.message }); }
+    catch (err) { return json(res, err.status === 429 ? 429 : err.status === 404 ? 404 : err.status === 503 ? 503 : 502, { error: err.message }); }
   }
 
   return json(res, 404, { error: "Not found" });
