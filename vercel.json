@@ -2,8 +2,8 @@
   "rewrites": [
     { "source": "/manifest.json", "destination": "/api/manifest.json" },
     { "source": "/search", "destination": "/api/search" },
-    { "source": "/stream/(.*)", "destination": "/api/stream/$1" },
+    { "source": "/stream/:id", "destination": "/api/stream?id=:id" },
     { "source": "/media", "destination": "/api/media" },
-    { "source": "/extras/(.*)", "destination": "/api/extras/$1" }
+    { "source": "/extras/:resource", "destination": "/api/extras?resource=:resource" }
   ]
 }
